@@ -1,6 +1,7 @@
 import html
 import json
 import re
+import time
 from datetime import datetime, timezone
 from urllib.parse import urlparse, urlunparse
 
@@ -11,9 +12,10 @@ SITEMAP = "https://huenox.com/sitemap.xml"
 OUTPUT = "google-feed.xml"
 TIMEOUT = 30
 MAX_ADDITIONAL_IMAGES = 10
+RETRIES = 3
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; HueNoxProductFeed/1.1; +https://huenox.com/)",
+    "User-Agent": "Mozilla/5.0 (compatible; HueNoxProductFeed/1.2; +https://huenox.com/)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
@@ -27,9 +29,17 @@ def clean_url(url):
 
 
 def fetch(url):
-    r = session.get(url, timeout=TIMEOUT)
-    r.raise_for_status()
-    return r.text
+    last_error = None
+    for attempt in range(1, RETRIES + 1):
+        try:
+            r = session.get(url, timeout=TIMEOUT)
+            r.raise_for_status()
+            return r.text
+        except Exception as exc:
+            last_error = exc
+            if attempt < RETRIES:
+                time.sleep(attempt * 2)
+    raise last_error
 
 
 def sitemap_products():
@@ -78,20 +88,31 @@ def product_jsonld(soup):
     return None
 
 
+def meta(soup, *, name=None, prop=None):
+    tag = None
+    if name:
+        tag = soup.find("meta", attrs={"name": name})
+    if not tag and prop:
+        tag = soup.find("meta", attrs={"property": prop})
+    return tag.get("content", "").strip() if tag else ""
+
+
 def clean_title(raw_title, url):
     path_name = urlparse(url).path.split("/catalogue/", 1)[0].strip("/")
     if path_name:
         title = path_name.replace("-", " ")
         title = re.sub(r"^HUE NOX\s+", "", title, flags=re.I)
         title = re.sub(r"^Hue Nox\s+", "", title, flags=re.I)
-        return re.sub(r"\s+", " ", title).strip()[:150]
+        title = re.sub(r"\s+", " ", title).strip()
+        return title[:150]
 
-    return re.sub(
+    title = re.sub(
         r"\s+Price in India\s*-\s*Buy.*$",
         "",
         raw_title or "",
         flags=re.I,
-    ).strip()[:150]
+    ).strip()
+    return title[:150]
 
 
 def clean_description(text):
@@ -114,11 +135,6 @@ def normalize_availability(value):
 
 
 def large_gallery_images(soup):
-    """
-    ShopDeck exposes the main product gallery as CloudFront NushopCatalogue
-    images with an image transformation such as w-600. Small w-80 images
-    are color/variant thumbnails and are intentionally excluded.
-    """
     images = []
     seen = set()
 
@@ -128,18 +144,11 @@ def large_gallery_images(soup):
             continue
         if "NushopCatalogue" not in src:
             continue
-
-        # Exclude 80x80 variant swatches/thumbs, tracking pixels and branding.
         if "w-80" in src or "brand_logo" in src:
             continue
-
-        # Prefer actual gallery-sized images. The fallback accepts images
-        # without a width transform in case ShopDeck changes its format.
-        is_gallery = ("w-600" in src) or ("cat_img" in src and "w-80" not in src)
-        if not is_gallery:
+        if not (("w-600" in src) or ("cat_img" in src and "w-80" not in src)):
             continue
 
-        # Normalize whitespace/URL encoding.
         src = src.replace(" ", "%20")
         if src not in seen:
             seen.add(src)
@@ -148,30 +157,74 @@ def large_gallery_images(soup):
     return images[: MAX_ADDITIONAL_IMAGES + 1]
 
 
+def fallback_product(soup, url):
+    """Build a usable feed item when ShopDeck omits Product JSON-LD."""
+    title = clean_title(meta(soup, prop="og:title") or (soup.title.get_text(" ", strip=True) if soup.title else ""), url)
+    description = clean_description(
+        meta(soup, prop="og:description") or meta(soup, name="description")
+    )
+
+    gallery = large_gallery_images(soup)
+    main_image = gallery[0] if gallery else meta(soup, prop="og:image")
+    additional = gallery[1:]
+
+    # Best-effort price/availability extraction from visible page text.
+    page_text = soup.get_text(" ", strip=True)
+    price_match = re.search(r"(?:Rs\.?|₹)\s*([0-9][0-9,]*(?:\.[0-9]+)?)", page_text)
+    price = price_match.group(1).replace(",", "") if price_match else ""
+
+    available = "in_stock"
+    if re.search(r"\bout\s+of\s+stock\b", page_text, re.I):
+        available = "out_of_stock"
+
+    # Stable ID from the final catalogue path segment.
+    sku = urlparse(url).path.rstrip("/").split("/")[-1]
+
+    return {
+        "id": sku,
+        "title": title or sku,
+        "description": description,
+        "link": url,
+        "image_link": main_image,
+        "additional_image_links": additional,
+        "price": price,
+        "currency": "INR",
+        "availability": available,
+        "condition": "new",
+        "brand": "HUE-NOX",
+        "color": "",
+        "parser": "fallback",
+    }
+
+
 def parse_product(url):
     soup = BeautifulSoup(fetch(url), "lxml")
     data = product_jsonld(soup)
+
     if not data:
-        raise ValueError("Product JSON-LD not found")
+        product = fallback_product(soup, url)
+        if not product["image_link"]:
+            raise ValueError("No Product JSON-LD and no usable product image found")
+        return product
 
     offers = data.get("offers") or {}
     if isinstance(offers, list):
         offers = offers[0] if offers else {}
 
+    images = data.get("image")
+    jsonld_image = ""
+    if isinstance(images, list):
+        jsonld_image = str(images[0]) if images else ""
+    else:
+        jsonld_image = str(images or "")
+
     gallery = large_gallery_images(soup)
-
-    # JSON-LD image is the fallback if gallery parsing ever misses it.
-    jsonld_image = data.get("image")
-    if isinstance(jsonld_image, list):
-        jsonld_image = jsonld_image[0] if jsonld_image else ""
-    jsonld_image = str(jsonld_image or "")
-
     if gallery:
         main_image = gallery[0]
-        additional_images = gallery[1:]
+        additional = gallery[1:]
     else:
         main_image = jsonld_image
-        additional_images = []
+        additional = []
 
     sku = first_text(data.get("sku")) or first_text(data.get("productID"))
 
@@ -181,13 +234,14 @@ def parse_product(url):
         "description": clean_description(first_text(data.get("description"))),
         "link": url,
         "image_link": main_image,
-        "additional_image_links": additional_images,
+        "additional_image_links": additional,
         "price": str(offers.get("price") or ""),
         "currency": str(offers.get("priceCurrency") or "INR").upper(),
         "availability": normalize_availability(offers.get("availability")),
         "condition": "new",
         "brand": first_text(data.get("brand")) or "HUE-NOX",
         "color": first_text(data.get("color")),
+        "parser": "jsonld",
     }
 
 
@@ -215,7 +269,12 @@ def build_feed(products):
             f"<g:description>{esc(p['description'])}</g:description>",
             f"<link>{esc(p['link'])}</link>",
             f"<g:image_link>{esc(p['image_link'])}</g:image_link>",
-            f"<g:price>{esc(p['price'])} {esc(p['currency'])}</g:price>",
+        ])
+
+        if p["price"]:
+            lines.append(f"<g:price>{esc(p['price'])} {esc(p['currency'])}</g:price>")
+
+        lines.extend([
             f"<g:availability>{esc(p['availability'])}</g:availability>",
             f"<g:condition>{esc(p['condition'])}</g:condition>",
             f"<g:brand>{esc(p['brand'])}</g:brand>",
@@ -237,10 +296,17 @@ def main():
     urls = sitemap_products()
     products = []
     failures = []
+    jsonld_count = 0
+    fallback_count = 0
 
     for url in urls:
         try:
-            products.append(parse_product(url))
+            product = parse_product(url)
+            products.append(product)
+            if product.get("parser") == "jsonld":
+                jsonld_count += 1
+            else:
+                fallback_count += 1
         except Exception as exc:
             failures.append((url, str(exc)))
 
@@ -252,15 +318,14 @@ def main():
 
     print(f"Products in sitemap: {len(urls)}")
     print(f"Products in feed: {len(products)}")
+    print(f"JSON-LD parsed: {jsonld_count}")
+    print(f"Fallback parsed: {fallback_count}")
     print(f"Failures: {len(failures)}")
-
-    total_images = sum(1 + len(p["additional_image_links"]) for p in products)
-    print(f"Total product images in feed: {total_images}")
+    print(f"Total product images in feed: {sum(1 + len(p['additional_image_links']) for p in products)}")
 
     if failures:
         for url, error in failures[:10]:
             print(f"FAILED: {url} :: {error}")
-        raise SystemExit(1)
 
     if not products:
         raise RuntimeError("No products were generated")
@@ -269,6 +334,10 @@ def main():
         file.write(build_feed(products))
 
     print(f"Generated: {OUTPUT}")
+
+    # A hard failure is reserved for cases where the feed is empty. Individual
+    # product failures are reported, but one malformed ShopDeck page will not
+    # take down the entire catalogue.
 
 
 if __name__ == "__main__":
