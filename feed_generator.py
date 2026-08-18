@@ -10,9 +10,10 @@ from bs4 import BeautifulSoup
 SITEMAP = "https://huenox.com/sitemap.xml"
 OUTPUT = "google-feed.xml"
 TIMEOUT = 30
+MAX_ADDITIONAL_IMAGES = 10
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (compatible; HueNoxProductFeed/1.0; +https://huenox.com/)",
+    "User-Agent": "Mozilla/5.0 (compatible; HueNoxProductFeed/1.1; +https://huenox.com/)",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
@@ -112,6 +113,41 @@ def normalize_availability(value):
     return mapping.get(value, "in_stock")
 
 
+def large_gallery_images(soup):
+    """
+    ShopDeck exposes the main product gallery as CloudFront NushopCatalogue
+    images with an image transformation such as w-600. Small w-80 images
+    are color/variant thumbnails and are intentionally excluded.
+    """
+    images = []
+    seen = set()
+
+    for img in soup.find_all("img", src=True):
+        src = img.get("src", "").strip()
+        if not src.startswith("http"):
+            continue
+        if "NushopCatalogue" not in src:
+            continue
+
+        # Exclude 80x80 variant swatches/thumbs, tracking pixels and branding.
+        if "w-80" in src or "brand_logo" in src:
+            continue
+
+        # Prefer actual gallery-sized images. The fallback accepts images
+        # without a width transform in case ShopDeck changes its format.
+        is_gallery = ("w-600" in src) or ("cat_img" in src and "w-80" not in src)
+        if not is_gallery:
+            continue
+
+        # Normalize whitespace/URL encoding.
+        src = src.replace(" ", "%20")
+        if src not in seen:
+            seen.add(src)
+            images.append(src)
+
+    return images[: MAX_ADDITIONAL_IMAGES + 1]
+
+
 def parse_product(url):
     soup = BeautifulSoup(fetch(url), "lxml")
     data = product_jsonld(soup)
@@ -122,8 +158,20 @@ def parse_product(url):
     if isinstance(offers, list):
         offers = offers[0] if offers else {}
 
-    images = data.get("image")
-    image = str(images[0]) if isinstance(images, list) and images else str(images or "")
+    gallery = large_gallery_images(soup)
+
+    # JSON-LD image is the fallback if gallery parsing ever misses it.
+    jsonld_image = data.get("image")
+    if isinstance(jsonld_image, list):
+        jsonld_image = jsonld_image[0] if jsonld_image else ""
+    jsonld_image = str(jsonld_image or "")
+
+    if gallery:
+        main_image = gallery[0]
+        additional_images = gallery[1:]
+    else:
+        main_image = jsonld_image
+        additional_images = []
 
     sku = first_text(data.get("sku")) or first_text(data.get("productID"))
 
@@ -132,7 +180,8 @@ def parse_product(url):
         "title": clean_title(first_text(data.get("name")), url),
         "description": clean_description(first_text(data.get("description"))),
         "link": url,
-        "image_link": image,
+        "image_link": main_image,
+        "additional_image_links": additional_images,
         "price": str(offers.get("price") or ""),
         "currency": str(offers.get("priceCurrency") or "INR").upper(),
         "availability": normalize_availability(offers.get("availability")),
@@ -171,8 +220,13 @@ def build_feed(products):
             f"<g:condition>{esc(p['condition'])}</g:condition>",
             f"<g:brand>{esc(p['brand'])}</g:brand>",
         ])
+
+        for image in p["additional_image_links"][:MAX_ADDITIONAL_IMAGES]:
+            lines.append(f"<g:additional_image_link>{esc(image)}</g:additional_image_link>")
+
         if p["color"]:
             lines.append(f"<g:color>{esc(p['color'])}</g:color>")
+
         lines.append("</item>")
 
     lines.extend(["</channel>", "</rss>"])
@@ -199,6 +253,9 @@ def main():
     print(f"Products in sitemap: {len(urls)}")
     print(f"Products in feed: {len(products)}")
     print(f"Failures: {len(failures)}")
+
+    total_images = sum(1 + len(p["additional_image_links"]) for p in products)
+    print(f"Total product images in feed: {total_images}")
 
     if failures:
         for url, error in failures[:10]:
